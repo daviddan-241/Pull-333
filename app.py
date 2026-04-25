@@ -1,7 +1,6 @@
-from flask import Flask, request
+from flask import Flask
 import os
-import sys
-import traceback
+import threading
 
 app = Flask(__name__)
 
@@ -11,29 +10,17 @@ def home():
 
 @app.route("/health")
 def health():
-    return {"status": "ok"}
-
-@app.route("/debug")
-def debug():
-    return {
-        "env": {
-            "TELEGRAM_TOKEN": "set" if os.getenv("TELEGRAM_TOKEN") else "missing",
-            "RENDER_EXTERNAL_URL": os.getenv("RENDER_EXTERNAL_URL", "not set"),
-        }
-    }
+    return {"status": "ok", "message": "alive"}
 
 def start_bot():
-    print("[BOT] Starting...", flush=True)
     try:
         from bot import run_bot
         run_bot()
     except Exception as e:
-        print(f"[BOT ERROR] {e}", flush=True)
-        traceback.print_exc()
+        print(f"[BOT ERROR] {e}")
 
 if __name__ == "__main__":
-    import threading
-    print("[MAIN] Starting...", flush=True)
     bot_thread = threading.Thread(target=start_bot, daemon=True)
     bot_thread.start()
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT", 10000)))
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host="0.0.0.0", port=port)
