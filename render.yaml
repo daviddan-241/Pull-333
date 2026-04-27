@@ -12,7 +12,15 @@ services:
         sync: false
       - key: TELEGRAM_TOKEN
         sync: false
-      - key: JUPITER_API_KEY
+      - key: SOLANA_RPC_URL
+        value: https://api.mainnet-beta.solana.com
+      - key: HELIUS_RPC_URL
         sync: false
-      - key: HELIUS_API_KEY
-        sync: false
+      - key: TOKEN_NAME
+        value: MyToken
+      - key: TOKEN_SYMBOL
+        value: MTK
+      - key: TOKEN_DECIMALS
+        value: "9"
+      - key: TOKEN_SUPPLY
+        value: "1000000000"

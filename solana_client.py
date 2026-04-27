@@ -1,158 +1,214 @@
+"""
+Real Solana client: balance reads, SPL token ops, Jupiter swaps,
+holder count + price via Jupiter / DexScreener / Helius.
+"""
+import os
 import base64
+import logging
 import requests
+
 from solana.rpc.api import Client
+from solana.rpc.commitment import Confirmed
 from solana.rpc.types import TxOpts
-from solders.transaction import VersionedTransaction
-from spl.token.instructions import (
-    get_associated_token_address, create_associated_token_account,
-    mint_to, MintToParams, initialize_mint, InitializeMintParams
-)
-from spl.token.constants import TOKEN_PROGRAM_ID
-from solana.transaction import Transaction
-from solders.system_program import CreateAccountParams, create_account
+from solders.keypair import Keypair
 from solders.pubkey import Pubkey
-from config import RPC_SOLANA, JUPITER_API_KEY, TOKEN_DECIMALS
+from solders.transaction import VersionedTransaction
+from solders.message import Message
+from solders.system_program import CreateAccountParams, create_account
+from solders.transaction import Transaction as SoldersLegacyTx
+
+from spl.token.constants import TOKEN_PROGRAM_ID
+from spl.token.instructions import (
+    initialize_mint, InitializeMintParams,
+    create_associated_token_account,
+    mint_to_checked, MintToCheckedParams,
+    get_associated_token_address,
+)
+
 from wallet_manager import wallet
 
-client = Client(RPC_SOLANA)
-kp = wallet.solana_keypair
+logger = logging.getLogger(__name__)
+
+RPC_URL = os.getenv("SOLANA_RPC_URL", "https://api.mainnet-beta.solana.com")
+JUPITER_QUOTE = "https://quote-api.jup.ag/v6/quote"
+JUPITER_SWAP = "https://quote-api.jup.ag/v6/swap"
+JUPITER_PRICE = "https://api.jup.ag/price/v2"
+DEXSCREENER_TOKEN = "https://api.dexscreener.com/latest/dex/tokens"
+SOL_MINT = "So11111111111111111111111111111111111111112"
+DEFAULT_DECIMALS = int(os.getenv("TOKEN_DECIMALS", "9"))
+
+_client = Client(RPC_URL, commitment=Confirmed)
+
 
 class SolanaTrader:
-    def __init__(self, keypair=None):
-        self.keypair = keypair or kp
-        self.wallet = str(self.keypair.pubkey()) if self.keypair else None
-        self.client = Client(RPC_SOLANA)
+    def __init__(self, payer: Keypair | None = None):
+        self.payer = payer or wallet.solana_keypair
+        self.pubkey = self.payer.pubkey()
 
-    def get_sol_balance(self):
+    def get_sol_balance(self) -> float:
         try:
-            return self.client.get_balance(self.keypair.pubkey()).value / 1e9
-        except:
+            resp = _client.get_balance(self.pubkey)
+            return resp.value / 1_000_000_000
+        except Exception as e:
+            logger.warning(f"get_sol_balance failed: {e}")
             return 0.0
 
-    def get_token_balance(self, mint: str):
+    def get_token_balance(self, mint_str: str) -> dict:
         try:
-            mint_pk = Pubkey.from_string(mint)
-            ata = get_associated_token_address(self.keypair.pubkey(), mint_pk)
-            resp = self.client.get_token_account_balance(ata)
-            if resp.value:
-                return {"ui": resp.value.ui_amount or 0, "raw": int(resp.value.amount)}
-            return {"ui": 0, "raw": 0}
-        except:
-            return {"ui": 0, "raw": 0}
+            mint = Pubkey.from_string(mint_str)
+            ata = get_associated_token_address(self.pubkey, mint)
+            resp = _client.get_token_account_balance(ata)
+            v = resp.value
+            return {"ui": float(v.ui_amount or 0), "raw": int(v.amount), "decimals": int(v.decimals)}
+        except Exception:
+            return {"ui": 0.0, "raw": 0, "decimals": DEFAULT_DECIMALS}
 
-    def get_quote(self, input_mint, output_mint, amount, slippage_bps=100):
-        url = "https://api.jup.ag/swap/v1/quote"
-        headers = {"x-api-key": JUPITER_API_KEY} if JUPITER_API_KEY else {}
-        params = {"inputMint": input_mint, "outputMint": output_mint, "amount": amount, "slippageBps": slippage_bps}
-        resp = requests.get(url, headers=headers, params=params, timeout=30)
-        return resp.json()
+    def _jupiter_swap(self, input_mint: str, output_mint: str, amount_raw: int, slippage_bps: int = 100) -> str:
+        q = requests.get(
+            JUPITER_QUOTE,
+            params={
+                "inputMint": input_mint,
+                "outputMint": output_mint,
+                "amount": amount_raw,
+                "slippageBps": slippage_bps,
+                "swapMode": "ExactIn",
+            },
+            timeout=20,
+        )
+        q.raise_for_status()
+        quote = q.json()
+        if "error" in quote:
+            raise RuntimeError(f"Jupiter quote: {quote['error']}")
 
-    def execute_swap(self, quote: dict):
-        url = "https://api.jup.ag/swap/v1/swap"
-        headers = {"Content-Type": "application/json"}
-        if JUPITER_API_KEY:
-            headers["x-api-key"] = JUPITER_API_KEY
-        payload = {"quoteResponse": quote, "userPublicKey": self.wallet, "wrapAndUnwrapSol": True}
-        swap_resp = requests.post(url, headers=headers, json=payload, timeout=30)
-        swap_data = swap_resp.json()
-        raw_tx = base64.b64decode(swap_data["swapTransaction"])
-        tx = VersionedTransaction.from_bytes(raw_tx)
-        signed_tx = VersionedTransaction(tx.message, [self.keypair])
-        opts = TxOpts(skip_preflight=False, preflight_commitment="confirmed")
-        result = self.client.send_transaction(signed_tx, opts=opts)
-        return str(result.value)
+        s = requests.post(
+            JUPITER_SWAP,
+            json={
+                "quoteResponse": quote,
+                "userPublicKey": str(self.pubkey),
+                "wrapAndUnwrapSol": True,
+                "dynamicComputeUnitLimit": True,
+                "prioritizationFeeLamports": "auto",
+            },
+            timeout=20,
+        )
+        s.raise_for_status()
+        swap_b64 = s.json()["swapTransaction"]
 
-    def sell_token(self, token_mint: str, amount_raw: int):
-        quote = self.get_quote(token_mint, "So11111111111111111111111111111111111111112", amount_raw)
-        return self.execute_swap(quote)
+        raw = base64.b64decode(swap_b64)
+        vtx = VersionedTransaction.from_bytes(raw)
+        signed = VersionedTransaction(vtx.message, [self.payer])
+        sig = _client.send_raw_transaction(bytes(signed), opts=TxOpts(skip_preflight=False)).value
+        return str(sig)
 
-    def buy_token(self, token_mint: str, sol_amount_lamports: int):
-        quote = self.get_quote("So11111111111111111111111111111111111111112", token_mint, sol_amount_lamports)
-        return self.execute_swap(quote)
+    def buy_token(self, mint_str: str, lamports: int) -> str:
+        return self._jupiter_swap(SOL_MINT, mint_str, lamports)
 
-    def send_sol(self, to_address: str, amount_lamports: int):
-        from solders.system_program import transfer, TransferParams
-        tx = Transaction()
-        tx.add(transfer(TransferParams(
-            from_pubkey=self.keypair.pubkey(),
-            to_pubkey=Pubkey.from_string(to_address),
-            lamports=amount_lamports
-        )))
-        tx.recent_blockhash = self.client.get_latest_blockhash().value.blockhash
-        tx.sign(self.keypair)
-        result = self.client.send_transaction(tx, self.keypair)
-        return str(result.value)
+    def sell_token(self, mint_str: str, raw_amount: int) -> str:
+        return self._jupiter_swap(mint_str, SOL_MINT, raw_amount)
+
 
 class SolanaTokenManager:
-    def __init__(self, keypair=None):
-        self.keypair = keypair or kp
-        self.client = Client(RPC_SOLANA)
+    def __init__(self, payer: Keypair | None = None, decimals: int = DEFAULT_DECIMALS):
+        self.payer = payer or wallet.solana_keypair
+        self.pubkey = self.payer.pubkey()
+        self.decimals = decimals
 
-    def create_mint(self, decimals=TOKEN_DECIMALS):
+    def create_mint(self) -> tuple[str, str]:
         mint_kp = Keypair()
-        mint_len = 82
-        rent = self.client.get_minimum_balance_for_rent_exemption(mint_len).value
-        tx = Transaction()
-        tx.add(create_account(CreateAccountParams(
-            from_pubkey=self.keypair.pubkey(), to_pubkey=mint_kp.pubkey(),
-            lamports=rent, space=mint_len, owner=TOKEN_PROGRAM_ID
-        )))
-        tx.add(initialize_mint(InitializeMintParams(
-            program_id=TOKEN_PROGRAM_ID, mint=mint_kp.pubkey(),
-            decimals=decimals, mint_authority=self.keypair.pubkey(), freeze_authority=None
-        )))
-        tx.recent_blockhash = self.client.get_latest_blockhash().value.blockhash
-        tx.sign(self.keypair, mint_kp)
-        result = self.client.send_transaction(tx, self.keypair, mint_kp)
-        return str(mint_kp.pubkey()), str(result.value)
 
-    def mint_to_wallet(self, mint: str, amount: int, recipient=None):
-        mint_pk = Pubkey.from_string(mint)
-        recipient_pk = Pubkey.from_string(recipient) if recipient else self.keypair.pubkey()
-        ata = get_associated_token_address(recipient_pk, mint_pk)
-        if not self.client.get_account_info(ata).value:
-            tx = Transaction()
-            tx.add(create_associated_token_account(payer=self.keypair.pubkey(), owner=recipient_pk, mint=mint_pk))
-            tx.recent_blockhash = self.client.get_latest_blockhash().value.blockhash
-            tx.sign(self.keypair)
-            self.client.send_transaction(tx, self.keypair)
-        tx = Transaction()
-        tx.add(mint_to(MintToParams(
-            program_id=TOKEN_PROGRAM_ID, mint=mint_pk, dest=ata,
-            authority=self.keypair.pubkey(), amount=amount
-        )))
-        tx.recent_blockhash = self.client.get_latest_blockhash().value.blockhash
-        tx.sign(self.keypair)
-        result = self.client.send_transaction(tx, self.keypair)
-        return str(result.value)
+        rent_resp = _client.get_minimum_balance_for_rent_exemption(82)
+        lamports = rent_resp.value
+
+        ix_create = create_account(
+            CreateAccountParams(
+                from_pubkey=self.pubkey,
+                to_pubkey=mint_kp.pubkey(),
+                lamports=lamports,
+                space=82,
+                owner=TOKEN_PROGRAM_ID,
+            )
+        )
+        ix_init = initialize_mint(
+            InitializeMintParams(
+                program_id=TOKEN_PROGRAM_ID,
+                mint=mint_kp.pubkey(),
+                decimals=self.decimals,
+                mint_authority=self.pubkey,
+                freeze_authority=self.pubkey,
+            )
+        )
+
+        bh = _client.get_latest_blockhash().value.blockhash
+        msg = Message.new_with_blockhash([ix_create, ix_init], self.pubkey, bh)
+        tx = SoldersLegacyTx([self.payer, mint_kp], msg, bh)
+        sig = _client.send_raw_transaction(bytes(tx), opts=TxOpts(skip_preflight=False)).value
+        return str(mint_kp.pubkey()), str(sig)
+
+    def mint_to_wallet(self, mint_str: str, amount_raw: int) -> str:
+        mint = Pubkey.from_string(mint_str)
+        ata = get_associated_token_address(self.pubkey, mint)
+
+        ixs = []
+        info = _client.get_account_info(ata)
+        if info.value is None:
+            ixs.append(create_associated_token_account(self.pubkey, self.pubkey, mint))
+
+        ixs.append(
+            mint_to_checked(
+                MintToCheckedParams(
+                    program_id=TOKEN_PROGRAM_ID,
+                    mint=mint,
+                    dest=ata,
+                    mint_authority=self.pubkey,
+                    amount=amount_raw,
+                    decimals=self.decimals,
+                )
+            )
+        )
+
+        bh = _client.get_latest_blockhash().value.blockhash
+        msg = Message.new_with_blockhash(ixs, self.pubkey, bh)
+        tx = SoldersLegacyTx([self.payer], msg, bh)
+        sig = _client.send_raw_transaction(bytes(tx), opts=TxOpts(skip_preflight=False)).value
+        return str(sig)
+
 
 class SolanaAnalytics:
-    def get_holder_count(self, mint: str):
+    def get_holder_count(self, mint_str: str) -> int:
+        helius = os.getenv("HELIUS_RPC_URL")
+        if helius:
+            try:
+                r = requests.post(
+                    helius,
+                    json={
+                        "jsonrpc": "2.0", "id": 1, "method": "getTokenAccounts",
+                        "params": {"mint": mint_str, "limit": 1000},
+                    }, timeout=20,
+                )
+                data = r.json().get("result", {})
+                return int(data.get("total", len(data.get("token_accounts", []))))
+            except Exception as e:
+                logger.warning(f"Helius holder count failed: {e}")
+
         try:
-            url = f"https://mainnet.helius-rpc.com/?api-key={HELIUS_API_KEY}"
-            payload = {
-                "jsonrpc": "2.0", "id": 1, "method": "getProgramAccounts",
-                "params": ["TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
-                    {"encoding": "jsonParsed", "filters": [{"dataSize": 165}, {"memcmp": {"offset": 0, "bytes": mint}}]}]
-            }
-            resp = requests.post(url, json=payload, timeout=60)
-            data = resp.json()
-            count = 0
-            for acc in data.get("result", []):
-                try:
-                    if int(acc["account"]["data"]["parsed"]["info"]["tokenAmount"]["amount"]) > 0:
-                        count += 1
-                except:
-                    continue
-            return count
-        except:
+            resp = _client.get_token_largest_accounts(Pubkey.from_string(mint_str))
+            return sum(1 for a in resp.value if int(a.amount.amount) > 0)
+        except Exception:
             return 0
 
-    def get_token_price(self, mint: str):
+    def get_token_price(self, mint_str: str) -> float:
         try:
-            url = f"https://api.jup.ag/price/v2?ids={mint}"
-            resp = requests.get(url, timeout=10)
-            data = resp.json()
-            return float(data["data"][mint]["price"]) if "data" in data and mint in data["data"] else 0.0
-        except:
-            return 0.0
+            r = requests.get(JUPITER_PRICE, params={"ids": mint_str}, timeout=10)
+            data = r.json().get("data", {}).get(mint_str)
+            if data and data.get("price"):
+                return float(data["price"])
+        except Exception:
+            pass
+        try:
+            r = requests.get(f"{DEXSCREENER_TOKEN}/{mint_str}", timeout=10)
+            pairs = r.json().get("pairs") or []
+            if pairs:
+                return float(pairs[0].get("priceUsd") or 0.0)
+        except Exception:
+            pass
+        return 0.0

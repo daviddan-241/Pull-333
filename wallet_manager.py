@@ -5,7 +5,6 @@ Ethereum addr:  m/44'/60'/0'/0/0  (MetaMask-compatible)
 """
 import os
 import logging
-from typing import Optional
 
 from solders.keypair import Keypair
 from bip_utils import (
@@ -18,15 +17,13 @@ logger = logging.getLogger(__name__)
 
 
 def _solana_keypair_from_seed(seed_bytes: bytes) -> Keypair:
-    # SLIP-0010 ed25519 derivation, Phantom path m/44'/501'/0'/0'
     bip32 = Bip32Slip10Ed25519.FromSeed(seed_bytes)
     derived = bip32.DerivePath("m/44'/501'/0'/0'")
-    priv32 = derived.PrivateKey().Raw().ToBytes()  # 32-byte ed25519 seed
+    priv32 = derived.PrivateKey().Raw().ToBytes()
     return Keypair.from_seed(priv32)
 
 
 def _ethereum_address_from_seed(seed_bytes: bytes) -> tuple[str, str]:
-    # BIP44 secp256k1, MetaMask path m/44'/60'/0'/0/0
     bip44 = (
         Bip44.FromSeed(seed_bytes, Bip44Coins.ETHEREUM)
         .Purpose().Coin().Account(0)
@@ -42,11 +39,9 @@ class Wallet:
         self.seed_phrase = mnemonic.strip()
         seed_bytes = Bip39SeedGenerator(self.seed_phrase).Generate()
 
-        # Solana
         self.solana_keypair: Keypair = _solana_keypair_from_seed(seed_bytes)
         self.solana_pubkey: str = str(self.solana_keypair.pubkey())
 
-        # Ethereum
         self.eth_address, self.eth_private_key = _ethereum_address_from_seed(seed_bytes)
 
     def get_all_addresses(self) -> dict:
@@ -60,15 +55,14 @@ def _load_or_generate_mnemonic() -> str:
 
     new_mn = str(Bip39MnemonicGenerator().FromWordsNumber(Bip39WordsNum.WORDS_NUM_12))
     logger.warning("=" * 70)
-    logger.warning("⚠️  NO SEED_PHRASE ENV VAR — GENERATED A NEW WALLET FOR THIS RUN")
-    logger.warning("⚠️  SAVE THIS NOW or you'll lose access on next restart:")
-    logger.warning(f"    SEED_PHRASE=\"{new_mn}\"")
-    logger.warning("⚠️  Add it as an env var in Render, then redeploy.")
+    logger.warning("NO SEED_PHRASE ENV VAR - GENERATED A NEW WALLET FOR THIS RUN")
+    logger.warning("SAVE THIS NOW or you'll lose access on next restart:")
+    logger.warning(f'    SEED_PHRASE="{new_mn}"')
+    logger.warning("Add it as an env var in Render, then redeploy.")
     logger.warning("=" * 70)
     return new_mn
 
 
-# Singleton — imported as `from wallet_manager import wallet`
 wallet = Wallet(_load_or_generate_mnemonic())
 
 
