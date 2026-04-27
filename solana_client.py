@@ -1,6 +1,9 @@
 """
 Real Solana client: balance reads, SPL token ops, Jupiter swaps,
 holder count + price via Jupiter / DexScreener / Helius.
+
+Trades automatically route through Pump.fun (PumpPortal) for
+pre-graduation pump.fun tokens, otherwise through Jupiter.
 """
 import os
 import base64
@@ -47,8 +50,7 @@ class SolanaTrader:
 
     def get_sol_balance(self) -> float:
         try:
-            resp = _client.get_balance(self.pubkey)
-            return resp.value / 1_000_000_000
+            return _client.get_balance(self.pubkey).value / 1_000_000_000
         except Exception as e:
             logger.warning(f"get_sol_balance failed: {e}")
             return 0.0
@@ -57,53 +59,59 @@ class SolanaTrader:
         try:
             mint = Pubkey.from_string(mint_str)
             ata = get_associated_token_address(self.pubkey, mint)
-            resp = _client.get_token_account_balance(ata)
-            v = resp.value
+            v = _client.get_token_account_balance(ata).value
             return {"ui": float(v.ui_amount or 0), "raw": int(v.amount), "decimals": int(v.decimals)}
         except Exception:
             return {"ui": 0.0, "raw": 0, "decimals": DEFAULT_DECIMALS}
 
-    def _jupiter_swap(self, input_mint: str, output_mint: str, amount_raw: int, slippage_bps: int = 100) -> str:
-        q = requests.get(
-            JUPITER_QUOTE,
-            params={
-                "inputMint": input_mint,
-                "outputMint": output_mint,
-                "amount": amount_raw,
-                "slippageBps": slippage_bps,
-                "swapMode": "ExactIn",
-            },
-            timeout=20,
-        )
+    def _jupiter_swap(self, input_mint: str, output_mint: str,
+                      amount_raw: int, slippage_bps: int = 100) -> str:
+        q = requests.get(JUPITER_QUOTE, params={
+            "inputMint": input_mint, "outputMint": output_mint,
+            "amount": amount_raw, "slippageBps": slippage_bps,
+            "swapMode": "ExactIn",
+        }, timeout=20)
         q.raise_for_status()
         quote = q.json()
         if "error" in quote:
             raise RuntimeError(f"Jupiter quote: {quote['error']}")
 
-        s = requests.post(
-            JUPITER_SWAP,
-            json={
-                "quoteResponse": quote,
-                "userPublicKey": str(self.pubkey),
-                "wrapAndUnwrapSol": True,
-                "dynamicComputeUnitLimit": True,
-                "prioritizationFeeLamports": "auto",
-            },
-            timeout=20,
-        )
+        s = requests.post(JUPITER_SWAP, json={
+            "quoteResponse": quote,
+            "userPublicKey": str(self.pubkey),
+            "wrapAndUnwrapSol": True,
+            "dynamicComputeUnitLimit": True,
+            "prioritizationFeeLamports": "auto",
+        }, timeout=20)
         s.raise_for_status()
-        swap_b64 = s.json()["swapTransaction"]
-
-        raw = base64.b64decode(swap_b64)
+        raw = base64.b64decode(s.json()["swapTransaction"])
         vtx = VersionedTransaction.from_bytes(raw)
         signed = VersionedTransaction(vtx.message, [self.payer])
         sig = _client.send_raw_transaction(bytes(signed), opts=TxOpts(skip_preflight=False)).value
         return str(sig)
 
     def buy_token(self, mint_str: str, lamports: int) -> str:
+        # Auto-route pre-graduation pump.fun → PumpPortal
+        try:
+            from pumpfun_client import is_pumpfun_pre_graduation, PumpFunTrader
+            if is_pumpfun_pre_graduation(mint_str):
+                logger.info(f"[ROUTE] {mint_str[:10]}... → PumpPortal (pre-grad)")
+                return PumpFunTrader(self.payer).buy(mint_str, lamports / 1e9)
+        except Exception as e:
+            logger.warning(f"pumpfun route check failed, falling back to Jupiter: {e}")
         return self._jupiter_swap(SOL_MINT, mint_str, lamports)
 
     def sell_token(self, mint_str: str, raw_amount: int) -> str:
+        try:
+            from pumpfun_client import is_pumpfun_pre_graduation, PumpFunTrader
+            if is_pumpfun_pre_graduation(mint_str):
+                bal = self.get_token_balance(mint_str)
+                decimals = bal["decimals"] or 6
+                ui_amount = raw_amount / (10 ** decimals)
+                logger.info(f"[ROUTE] sell {mint_str[:10]}... → PumpPortal")
+                return PumpFunTrader(self.payer).sell(mint_str, ui_amount)
+        except Exception as e:
+            logger.warning(f"pumpfun route check failed, falling back to Jupiter: {e}")
         return self._jupiter_swap(mint_str, SOL_MINT, raw_amount)
 
 
@@ -115,29 +123,16 @@ class SolanaTokenManager:
 
     def create_mint(self) -> tuple[str, str]:
         mint_kp = Keypair()
-
-        rent_resp = _client.get_minimum_balance_for_rent_exemption(82)
-        lamports = rent_resp.value
-
-        ix_create = create_account(
-            CreateAccountParams(
-                from_pubkey=self.pubkey,
-                to_pubkey=mint_kp.pubkey(),
-                lamports=lamports,
-                space=82,
-                owner=TOKEN_PROGRAM_ID,
-            )
-        )
-        ix_init = initialize_mint(
-            InitializeMintParams(
-                program_id=TOKEN_PROGRAM_ID,
-                mint=mint_kp.pubkey(),
-                decimals=self.decimals,
-                mint_authority=self.pubkey,
-                freeze_authority=self.pubkey,
-            )
-        )
-
+        lamports = _client.get_minimum_balance_for_rent_exemption(82).value
+        ix_create = create_account(CreateAccountParams(
+            from_pubkey=self.pubkey, to_pubkey=mint_kp.pubkey(),
+            lamports=lamports, space=82, owner=TOKEN_PROGRAM_ID,
+        ))
+        ix_init = initialize_mint(InitializeMintParams(
+            program_id=TOKEN_PROGRAM_ID, mint=mint_kp.pubkey(),
+            decimals=self.decimals, mint_authority=self.pubkey,
+            freeze_authority=self.pubkey,
+        ))
         bh = _client.get_latest_blockhash().value.blockhash
         msg = Message.new_with_blockhash([ix_create, ix_init], self.pubkey, bh)
         tx = SoldersLegacyTx([self.payer, mint_kp], msg, bh)
@@ -147,25 +142,13 @@ class SolanaTokenManager:
     def mint_to_wallet(self, mint_str: str, amount_raw: int) -> str:
         mint = Pubkey.from_string(mint_str)
         ata = get_associated_token_address(self.pubkey, mint)
-
         ixs = []
-        info = _client.get_account_info(ata)
-        if info.value is None:
+        if _client.get_account_info(ata).value is None:
             ixs.append(create_associated_token_account(self.pubkey, self.pubkey, mint))
-
-        ixs.append(
-            mint_to_checked(
-                MintToCheckedParams(
-                    program_id=TOKEN_PROGRAM_ID,
-                    mint=mint,
-                    dest=ata,
-                    mint_authority=self.pubkey,
-                    amount=amount_raw,
-                    decimals=self.decimals,
-                )
-            )
-        )
-
+        ixs.append(mint_to_checked(MintToCheckedParams(
+            program_id=TOKEN_PROGRAM_ID, mint=mint, dest=ata,
+            mint_authority=self.pubkey, amount=amount_raw, decimals=self.decimals,
+        )))
         bh = _client.get_latest_blockhash().value.blockhash
         msg = Message.new_with_blockhash(ixs, self.pubkey, bh)
         tx = SoldersLegacyTx([self.payer], msg, bh)
@@ -178,18 +161,14 @@ class SolanaAnalytics:
         helius = os.getenv("HELIUS_RPC_URL")
         if helius:
             try:
-                r = requests.post(
-                    helius,
-                    json={
-                        "jsonrpc": "2.0", "id": 1, "method": "getTokenAccounts",
-                        "params": {"mint": mint_str, "limit": 1000},
-                    }, timeout=20,
-                )
+                r = requests.post(helius, json={
+                    "jsonrpc": "2.0", "id": 1, "method": "getTokenAccounts",
+                    "params": {"mint": mint_str, "limit": 1000},
+                }, timeout=20)
                 data = r.json().get("result", {})
                 return int(data.get("total", len(data.get("token_accounts", []))))
             except Exception as e:
                 logger.warning(f"Helius holder count failed: {e}")
-
         try:
             resp = _client.get_token_largest_accounts(Pubkey.from_string(mint_str))
             return sum(1 for a in resp.value if int(a.amount.amount) > 0)
