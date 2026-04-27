@@ -1,32 +1,77 @@
-from mnemonic import Mnemonic
+"""
+Real wallet derivation from a BIP39 seed phrase.
+Solana keypair: m/44'/501'/0'/0' (Phantom-compatible)
+Ethereum addr:  m/44'/60'/0'/0/0  (MetaMask-compatible)
+"""
+import os
+import logging
+from typing import Optional
+
 from solders.keypair import Keypair
-from eth_account import Account
-import hashlib
-from config import SEED_PHRASE, PRIVATE_KEY_SOL
+from bip_utils import (
+    Bip39MnemonicGenerator, Bip39SeedGenerator, Bip39WordsNum,
+    Bip44, Bip44Coins, Bip44Changes,
+    Bip32Slip10Ed25519,
+)
 
-class MultiChainWallet:
-    def __init__(self):
-        self._sol_keypair = None
-        if SEED_PHRASE:
-            try:
-                mnemo = Mnemonic("english")
-                seed = mnemo.to_seed(SEED_PHRASE)
-                sol_seed = hashlib.sha256(seed + b"solana").digest()
-                self._sol_keypair = Keypair.from_seed(sol_seed[:32])
-            except Exception as e:
-                print(f"[Wallet] Seed error: {e}")
-        elif PRIVATE_KEY_SOL:
-            try:
-                self._sol_keypair = Keypair.from_base58_string(PRIVATE_KEY_SOL)
-            except Exception as e:
-                print(f"[Wallet] Key error: {e}")
+logger = logging.getLogger(__name__)
 
-    @property
-    def solana_keypair(self):
-        return self._sol_keypair
 
-    @property
-    def solana_pubkey(self):
-        return str(self._sol_keypair.pubkey()) if self._sol_keypair else "Not set"
+def _solana_keypair_from_seed(seed_bytes: bytes) -> Keypair:
+    # SLIP-0010 ed25519 derivation, Phantom path m/44'/501'/0'/0'
+    bip32 = Bip32Slip10Ed25519.FromSeed(seed_bytes)
+    derived = bip32.DerivePath("m/44'/501'/0'/0'")
+    priv32 = derived.PrivateKey().Raw().ToBytes()  # 32-byte ed25519 seed
+    return Keypair.from_seed(priv32)
 
-wallet = MultiChainWallet()
+
+def _ethereum_address_from_seed(seed_bytes: bytes) -> tuple[str, str]:
+    # BIP44 secp256k1, MetaMask path m/44'/60'/0'/0/0
+    bip44 = (
+        Bip44.FromSeed(seed_bytes, Bip44Coins.ETHEREUM)
+        .Purpose().Coin().Account(0)
+        .Change(Bip44Changes.CHAIN_EXT).AddressIndex(0)
+    )
+    addr = bip44.PublicKey().ToAddress()
+    priv_hex = bip44.PrivateKey().Raw().ToHex()
+    return addr, priv_hex
+
+
+class Wallet:
+    def __init__(self, mnemonic: str):
+        self.seed_phrase = mnemonic.strip()
+        seed_bytes = Bip39SeedGenerator(self.seed_phrase).Generate()
+
+        # Solana
+        self.solana_keypair: Keypair = _solana_keypair_from_seed(seed_bytes)
+        self.solana_pubkey: str = str(self.solana_keypair.pubkey())
+
+        # Ethereum
+        self.eth_address, self.eth_private_key = _ethereum_address_from_seed(seed_bytes)
+
+    def get_all_addresses(self) -> dict:
+        return {"solana": self.solana_pubkey, "ethereum": self.eth_address}
+
+
+def _load_or_generate_mnemonic() -> str:
+    mnemonic = os.getenv("SEED_PHRASE", "").strip()
+    if mnemonic:
+        return mnemonic
+
+    new_mn = str(Bip39MnemonicGenerator().FromWordsNumber(Bip39WordsNum.WORDS_NUM_12))
+    logger.warning("=" * 70)
+    logger.warning("⚠️  NO SEED_PHRASE ENV VAR — GENERATED A NEW WALLET FOR THIS RUN")
+    logger.warning("⚠️  SAVE THIS NOW or you'll lose access on next restart:")
+    logger.warning(f"    SEED_PHRASE=\"{new_mn}\"")
+    logger.warning("⚠️  Add it as an env var in Render, then redeploy.")
+    logger.warning("=" * 70)
+    return new_mn
+
+
+# Singleton — imported as `from wallet_manager import wallet`
+wallet = Wallet(_load_or_generate_mnemonic())
+
+
+def generate_volume_wallets(n: int = 5) -> list[Keypair]:
+    """Generate N fresh ephemeral Keypairs for the volume bot."""
+    return [Keypair() for _ in range(n)]
